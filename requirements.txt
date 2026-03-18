@@ -1,0 +1,8 @@
+streamlit==1.39.0
+pandas==2.2.2
+Pillow==10.4.0
+PyMuPDF==1.24.10
+pytesseract==0.3.13
+groq>=0.11.0
+gtts>=2.5.0
+deep-translator>=1.11.4
