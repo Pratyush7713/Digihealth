@@ -17,7 +17,11 @@ from groq import Groq
 from gtts import gTTS
 from PIL import Image
 
-DATA_PATH = os.path.join("data", "users.csv")
+DATA_PATHS = [
+    os.path.join("data", "users.csv"),  # legacy
+    os.path.join("data", "patients", "users.csv"),
+    os.path.join("data", "patients", "patients.csv"),
+]
 STORAGE_ROOT = os.path.join("storage")
 HISTORY_FILE = "disease_history.json"
 
@@ -27,7 +31,150 @@ if os.name == 'nt':  # Windows
     if os.path.exists(tesseract_cmd):
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-st.set_page_config(page_title="Swasthi Health Locker (MVP)", page_icon="🩺", layout="wide")
+st.set_page_config(page_title="Hospital LIS & OPD System", page_icon="🏥", layout="wide")
+
+# ============== Hospital System Paths ==============
+DOCTORS_PATH = os.path.join("data", "doctors", "doctors.csv")
+OPD_PATIENTS_PATH = os.path.join("data", "opd", "opd_patients.json")
+LAB_REQUESTS_PATH = os.path.join("data", "lab", "lab_requests.json")
+LOINC_DB_PATHS = [
+    os.path.join("data", "loinc", "loinc_mapping.json"),
+    os.path.join("data", "loinc", "loinc_mapping.csv"),
+]
+LOINC_TABLE_CORE_PATH = "LoincTableCore.csv"
+LAB_REPORTS_DIR = os.path.join("storage", "lab_reports")
+os.makedirs(LAB_REPORTS_DIR, exist_ok=True)
+
+
+def first_existing_path(paths: List[str]) -> Optional[str]:
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+@st.cache_data
+def load_loinc_db() -> Dict[str, str]:
+    """
+    Load a custom LOINC mapping database if present.
+    Supports:
+    - JSON list of objects with keys: test_name, loinc_code
+    - CSV with columns: test_name, loinc_code
+    Returns normalized dict: normalized_test_name -> loinc_code
+    """
+    path = first_existing_path(LOINC_DB_PATHS)
+    if not path:
+        return {}
+
+    mapping: Dict[str, str] = {}
+    try:
+        if path.lower().endswith(".json"):
+            with open(path, "r") as f:
+                rows = json.load(f)
+            for r in rows or []:
+                name = str(r.get("test_name", "")).strip()
+                code = str(r.get("loinc_code", "")).strip()
+                if name and code:
+                    mapping[name.lower()] = code
+        elif path.lower().endswith(".csv"):
+            df = pd.read_csv(path, dtype=str).fillna("")
+            for _, row in df.iterrows():
+                name = str(row.get("test_name", "")).strip()
+                code = str(row.get("loinc_code", "")).strip()
+                if name and code:
+                    mapping[name.lower()] = code
+    except Exception:
+        return {}
+
+    return mapping
+
+
+@st.cache_data
+def load_loinc_core_index() -> Dict[str, str]:
+    """
+    Build a small index from LoincTableCore.csv if present.
+    Maps SHORTNAME and LONG_COMMON_NAME (lowercased) -> LOINC_NUM.
+    """
+    if not os.path.exists(LOINC_TABLE_CORE_PATH):
+        return {}
+    try:
+        df = pd.read_csv(
+            LOINC_TABLE_CORE_PATH,
+            usecols=["LOINC_NUM", "LONG_COMMON_NAME", "SHORTNAME"],
+            dtype=str,
+            low_memory=False,
+        ).fillna("")
+        idx: Dict[str, str] = {}
+        for _, row in df.iterrows():
+            code = row.get("LOINC_NUM", "")
+            short = row.get("SHORTNAME", "").strip()
+            long = row.get("LONG_COMMON_NAME", "").strip()
+            if code:
+                if short:
+                    idx[short.lower()] = code
+                if long:
+                    idx[long.lower()] = code
+        return idx
+    except Exception:
+        return {}
+
+
+def test_to_loinc(test_name: str) -> str:
+    """Convert test name to LOINC code. Returns code or 'UNKNOWN' if not found."""
+    key = test_name.strip().lower()
+
+    custom = load_loinc_db()
+    if key in custom:
+        return custom[key]
+    for k, v in custom.items():
+        if k in key or key in k:
+            return v
+
+    core = load_loinc_core_index()
+    if key in core:
+        return core[key]
+    return "UNKNOWN"
+
+
+def load_doctors() -> pd.DataFrame:
+    try:
+        if not os.path.exists(DOCTORS_PATH):
+            return pd.DataFrame(columns=["doctor_id", "name", "password"])
+        return pd.read_csv(DOCTORS_PATH, dtype={"doctor_id": str})
+    except Exception:
+        return pd.DataFrame(columns=["doctor_id", "name", "password"])
+
+
+def load_opd_patients() -> List[Dict]:
+    try:
+        if not os.path.exists(OPD_PATIENTS_PATH):
+            return []
+        with open(OPD_PATIENTS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_opd_patients(data: List[Dict]):
+    os.makedirs(os.path.dirname(OPD_PATIENTS_PATH), exist_ok=True)
+    with open(OPD_PATIENTS_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_lab_requests() -> List[Dict]:
+    try:
+        if not os.path.exists(LAB_REQUESTS_PATH):
+            return []
+        with open(LAB_REQUESTS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_lab_requests(data: List[Dict]):
+    os.makedirs(os.path.dirname(LAB_REQUESTS_PATH), exist_ok=True)
+    with open(LAB_REQUESTS_PATH, "w") as f:
+        json.dump(data, f, indent=2)
 
 def get_groq_client():
     """Initialize Groq client with API key from environment or Streamlit secrets (Groq is free!)"""
@@ -534,8 +681,7 @@ def add_to_history(aadhaar: str, file_name: str, disease_name: str, parsed: dict
     
     # Extract patient name if available
     patient_name = parsed.get("patient_name") or parsed.get("patient name") or parsed.get("name") or "Not specified"
-    
-    # Check if this file already exists in history (update instead of duplicate)
+        # Check if this file already exists in history (update instead of duplicate)
     existing_idx = None
     for idx, entry in enumerate(history):
         if entry.get("file_name") == file_name:
@@ -573,7 +719,11 @@ def add_to_history(aadhaar: str, file_name: str, disease_name: str, parsed: dict
 
 @st.cache_data
 def load_users():
-    return pd.read_csv(DATA_PATH, dtype={"aadhaar_id": str, "name": str, "dob": str})
+    path = first_existing_path(DATA_PATHS)
+    if not path:
+        # return empty DF with expected columns so UI can show a friendly error
+        return pd.DataFrame(columns=["aadhaar_id", "name", "dob"])
+    return pd.read_csv(path, dtype={"aadhaar_id": str, "name": str, "dob": str})
 
 
 def ensure_user_dir(aadhaar: str) -> str:
@@ -850,13 +1000,345 @@ def generate_structured_summary(text: str, parsed: dict, file_name: str = "", aa
     return (content if content.strip() else "No key findings detected.", primary_disease, meds, short_summary, lab_analysis)
 
 
-def login_view():
-    st.title("Swasthi Health Locker – MVP")
+# ============== Main Landing Page ==============
+def main_landing_view():
+    st.title("🏥 Hospital Information System")
+    st.markdown("**Laboratory Information System (LIS) integrated with OPD Module**")
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("### 👨‍⚕️ OPD")
+        st.markdown("Outpatient Department - Doctor Portal")
+        st.caption("Login to view patients, recommend tests, and access lab reports")
+        if st.button("Enter OPD Portal →", key="opd_btn", use_container_width=True, type="primary"):
+            st.session_state["hospital_section"] = "opd"
+            st.rerun()
+    
+    with col2:
+        st.markdown("### 🔬 Laboratory")
+        st.markdown("Laboratory Information System")
+        st.caption("View pending test requests and upload lab reports")
+        if st.button("Enter Laboratory →", key="lab_btn", use_container_width=True, type="primary"):
+            st.session_state["hospital_section"] = "laboratory"
+            st.rerun()
+    
+    with col3:
+        st.markdown("### 👤 Patient")
+        st.markdown("Patient Portal - Swasthi Health Locker")
+        st.caption("Upload records, view summaries, and manage your health data")
+        if st.button("Enter Patient Portal →", key="patient_btn", use_container_width=True, type="primary"):
+            st.session_state["hospital_section"] = "patient"
+            st.rerun()
+    
+    st.markdown("---")
+    st.caption("Select a section above to continue")
+
+
+# ============== OPD Section ==============
+def opd_doctor_login():
+    st.title("👨‍⚕️ OPD - Doctor Portal")
+    st.caption("Login with Doctor ID and Password")
+    
+    doctors = load_doctors()
+    
+    with st.form("opd_login_form"):
+        doctor_id = st.text_input("Doctor ID", max_chars=20).strip()
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+    
+    if submitted:
+        if not doctor_id or not password:
+            st.error("Enter Doctor ID and Password.")
+            return
+        row = doctors.loc[(doctors["doctor_id"] == doctor_id) & (doctors["password"] == password)]
+        if row.empty:
+            st.error("Invalid credentials.")
+            return
+        doc = row.iloc[0].to_dict()
+        st.session_state["opd_logged_in"] = True
+        st.session_state["opd_doctor"] = doc
+        st.success(f"Welcome, {doc['name']}!")
+        st.rerun()
+
+
+def generate_opd_patient_pdf(patient: Dict) -> bytes:
+    """Generate a PDF for OPD patient vitals."""
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    
+    text = f"""
+OPD PATIENT VITALS
+==================
+
+Name:     {patient.get('name', 'N/A')}
+Age:      {patient.get('age', 'N/A')} years
+Gender:   {patient.get('gender', 'N/A')}
+BP:       {patient.get('bp', 'N/A')}
+Weight:   {patient.get('weight', 'N/A')} kg
+
+Symptoms:
+{patient.get('symptoms', 'N/A')}
+
+Patient ID: {patient.get('patient_id', 'N/A')}
+Date: {patient.get('date', datetime.now().strftime('%Y-%m-%d'))}
+"""
+    page.insert_text((50, 50), text, fontsize=12)
+    pdf_bytes = doc.write()
+    doc.close()
+    return pdf_bytes
+
+
+def opd_doctor_portal():
+    doc = st.session_state["opd_doctor"]
+    
+    col_back, col_h, col_logout = st.columns([1, 3, 1])
+    with col_back:
+        if st.button("← Home", key="opd_portal_home"):
+            st.session_state.pop("opd_logged_in", None)
+            st.session_state.pop("opd_doctor", None)
+            st.session_state["hospital_section"] = None
+            st.rerun()
+    with col_h:
+        st.subheader(f"👨‍⚕️ OPD Portal - {doc['name']}")
+    with col_logout:
+        if st.button("Logout"):
+            st.session_state.pop("opd_logged_in", None)
+            st.session_state.pop("opd_doctor", None)
+            st.rerun()
+    
+    tab_prev, tab_new, tab_reports = st.tabs(["Previous Patients", "New Patients", "Lab Reports"])
+    
+    with tab_prev:
+        st.markdown("#### View Previous Patient Information")
+        patient_id = st.text_input("Enter Patient ID (Aadhaar)", key="prev_patient_id").strip()
+        if patient_id and st.button("View Patient"):
+            users = load_users()
+            row = users.loc[users["aadhaar_id"] == patient_id]
+            if row.empty:
+                st.warning("Patient not found.")
+            else:
+                user = row.iloc[0].to_dict()
+                history = load_disease_history(patient_id)
+                st.success(f"Patient: {user['name']}")
+                if not history:
+                    st.info("No medical records found for this patient.")
+                else:
+                    for entry in history:
+                        with st.expander(f"📄 {entry.get('file_name', 'Record')} - {entry.get('date', '')}"):
+                            st.markdown(f"**Diagnosis:** {entry.get('disease', 'N/A')}")
+                            st.markdown(f"**Symptoms:** {entry.get('symptoms', 'N/A')}")
+                            st.markdown(f"**Doctor:** {entry.get('doctor', 'N/A')}")
+    
+    with tab_new:
+        st.markdown("#### New Patients in OPD")
+        opd_patients = load_opd_patients()
+        
+        # Add new OPD patient form
+        with st.expander("➕ Register New OPD Patient", expanded=len(opd_patients) == 0):
+            with st.form("add_opd_patient"):
+                p_name = st.text_input("Patient Name")
+                p_age = st.number_input("Age", min_value=1, max_value=120, value=30)
+                p_gender = st.selectbox("Gender", ["Male", "Female", "Other"])
+                p_bp = st.text_input("BP (e.g., 120/80)", value="120/80")
+                p_weight = st.number_input("Weight (kg)", min_value=1.0, value=70.0)
+                p_symptoms = st.text_area("Symptoms / Chief Complaint")
+                p_aadhaar = st.text_input("Patient ID (Aadhaar - 12 digits)", max_chars=12)
+                if st.form_submit_button("Add to OPD"):
+                    if len(p_aadhaar) == 12 and p_aadhaar.isdigit():
+                        pid = f"OPD_{datetime.now().strftime('%Y%m%d%H%M%S')}_{p_aadhaar[-4:]}"
+                        new_p = {
+                            "patient_id": p_aadhaar,
+                            "opd_id": pid,
+                            "name": p_name,
+                            "age": p_age,
+                            "gender": p_gender,
+                            "bp": p_bp,
+                            "weight": p_weight,
+                            "symptoms": p_symptoms or "Not specified",
+                            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "doctor_id": doc["doctor_id"],
+                        }
+                        opd_patients.append(new_p)
+                        save_opd_patients(opd_patients)
+                        st.success("Patient added!")
+                        st.rerun()
+                    else:
+                        st.error("Valid 12-digit Aadhaar required.")
+        
+        if not opd_patients:
+            st.info("No new patients. Add one above.")
+        else:
+            for p in opd_patients:
+                with st.container(border=True):
+                    c1, c2 = st.columns([3, 1])
+                    with c1:
+                        st.write(f"**{p['name']}** | Age: {p['age']} | BP: {p['bp']} | Weight: {p['weight']} kg")
+                        st.caption(f"Symptoms: {p['symptoms'][:80]}...")
+                    with c2:
+                        if st.button("View PDF", key=f"pdf_{p['opd_id']}"):
+                            st.session_state["opd_view_pdf"] = p
+                            st.rerun()
+                        if st.button("Recommend Tests", key=f"rec_{p['opd_id']}"):
+                            st.session_state["opd_recommend_for"] = p
+                            st.rerun()
+        
+        if "opd_view_pdf" in st.session_state:
+            p = st.session_state["opd_view_pdf"]
+            pdf_bytes = generate_opd_patient_pdf(p)
+            st.download_button("📥 Download Patient Vitals PDF", data=pdf_bytes, file_name=f"opd_{p['opd_id']}.pdf", mime="application/pdf")
+            if st.button("Close"):
+                st.session_state.pop("opd_view_pdf", None)
+                st.rerun()
+        
+        if "opd_recommend_for" in st.session_state:
+            p = st.session_state["opd_recommend_for"]
+            st.markdown(f"#### Recommend Tests for {p['name']}")
+            tests_input = st.text_input("Enter test names (comma-separated, e.g. CBC, Glucose, Hemoglobin)", key="rec_tests")
+            if st.button("Send to Laboratory"):
+                test_list = [t.strip() for t in tests_input.split(",") if t.strip()]
+                if not test_list:
+                    st.error("Enter at least one test.")
+                else:
+                    loinc_codes = [(t, test_to_loinc(t)) for t in test_list]
+                    req = {
+                        "request_id": f"REQ_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                        "patient_id": p["patient_id"],
+                        "patient_name": p["name"],
+                        "doctor_id": doc["doctor_id"],
+                        "doctor_name": doc["name"],
+                        "tests": test_list,
+                        "loinc_codes": [{"test": t, "loinc": c} for t, c in loinc_codes],
+                        "status": "pending",
+                        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "opd_id": p.get("opd_id", ""),
+                    }
+                    requests = load_lab_requests()
+                    requests.append(req)
+                    save_lab_requests(requests)
+                    st.success("Tests sent to Laboratory!")
+                    st.session_state.pop("opd_recommend_for", None)
+                    st.rerun()
+            if st.button("Cancel", key="cancel_rec"):
+                st.session_state.pop("opd_recommend_for", None)
+                st.rerun()
+    
+    with tab_reports:
+        st.markdown("#### View Lab Reports")
+        report_view = st.radio("Show reports:", ["My Requested Reports Only", "Complete Patient Reports"], key="report_view")
+        
+        patient_id = st.text_input("Enter Patient ID (Aadhaar)", key="report_patient_id").strip()
+        if patient_id and st.button("View Reports"):
+            reports_dir = os.path.join(LAB_REPORTS_DIR, patient_id)
+            if not os.path.isdir(reports_dir):
+                st.info("No lab reports found for this patient.")
+            else:
+                all_reports = []
+                for fname in os.listdir(reports_dir):
+                    fpath = os.path.join(reports_dir, fname)
+                    if os.path.isfile(fpath) and fname.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
+                        meta_path = fpath + ".meta.json"
+                        meta = {}
+                        if os.path.exists(meta_path):
+                            with open(meta_path) as mf:
+                                meta = json.load(mf)
+                        all_reports.append({"path": fpath, "name": fname, "meta": meta})
+                
+                if report_view == "My Requested Reports Only":
+                    all_reports = [r for r in all_reports if r["meta"].get("doctor_id") == doc["doctor_id"]]
+                
+                if not all_reports:
+                    st.info("No reports matching your selection.")
+                else:
+                    for r in all_reports:
+                        with st.expander(f"📄 {r['name']}"):
+                            if r["path"].lower().endswith(".pdf"):
+                                doc_pdf = fitz.open(r["path"])
+                                for i in range(len(doc_pdf)):
+                                    page = doc_pdf[i]
+                                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                                    st.image(pix.tobytes("png"), caption=f"Page {i+1}")
+                                doc_pdf.close()
+                            else:
+                                st.image(r["path"])
+                            with open(r["path"], "rb") as f:
+                                st.download_button("Download", data=f.read(), file_name=r["name"], key=f"dl_{r['name']}")
+
+
+# ============== Laboratory Section ==============
+def laboratory_view():
+    st.title("🔬 Laboratory Information System")
+    
+    tab_pending, tab_upload = st.tabs(["Pending Requests", "Upload Report"])
+    
+    with tab_pending:
+        requests = load_lab_requests()
+        pending = [r for r in requests if r.get("status") == "pending"]
+        if not pending:
+            st.info("No pending test requests.")
+        else:
+            for req in pending:
+                with st.container(border=True):
+                    st.write(f"**Request ID:** {req['request_id']}")
+                    st.write(f"**Patient:** {req.get('patient_name', 'N/A')} (ID: {req['patient_id']})")
+                    st.write(f"**Doctor:** {req.get('doctor_name', 'N/A')}")
+                    st.write("**Tests (LOINC):**")
+                    for item in req.get("loinc_codes", []):
+                        st.caption(f"  - {item.get('test', '')} → LOINC: {item.get('loinc', '')}")
+                    st.caption(f"Date: {req.get('date', '')}")
+    
+    with tab_upload:
+        st.markdown("#### Upload Lab Report for Patient")
+        patient_id = st.text_input("Patient ID (Aadhaar)", key="lab_upload_patient").strip()
+        request_id = st.text_input("Request ID (optional)", key="lab_upload_req").strip()
+        
+        if patient_id:
+            requests = load_lab_requests()
+            doc_reqs = [r for r in requests if r["patient_id"] == patient_id]
+            request_id = ""
+            doctor_id = ""
+            if doc_reqs:
+                sel = st.selectbox("Link to request:", [r["request_id"] for r in doc_reqs], key="lab_link_req")
+                req = next(r for r in doc_reqs if r["request_id"] == sel)
+                request_id = req["request_id"]
+                doctor_id = req.get("doctor_id", "")
+            
+            uploaded = st.file_uploader("Upload Report (PDF or Image)", type=["pdf", "png", "jpg", "jpeg"])
+            if uploaded and st.button("Save Report"):
+                pt_dir = os.path.join(LAB_REPORTS_DIR, patient_id)
+                os.makedirs(pt_dir, exist_ok=True)
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                fname = f"{ts}__{uploaded.name}"
+                fpath = os.path.join(pt_dir, fname)
+                with open(fpath, "wb") as f:
+                    f.write(uploaded.getbuffer())
+                meta = {"patient_id": patient_id, "request_id": request_id, "doctor_id": doctor_id, "uploaded_at": datetime.now().isoformat()}
+                with open(fpath + ".meta.json", "w") as mf:
+                    json.dump(meta, mf)
+                for r in requests:
+                    if r.get("request_id") == request_id:
+                        r["status"] = "completed"
+                        break
+                save_lab_requests(requests)
+                st.success("Report uploaded and sent to doctor!")
+
+
+# ============== Patient Section ==============
+def patient_login_view():
+    st.title("Swasthi Health Locker – Patient Portal")
     st.caption("Login with Aadhaar ID and Date of Birth")
 
     users = load_users()
+    if users.empty:
+        st.error(
+            "Patient database not found. Add one of these files: "
+            "`data/patients/patients.csv`, `data/patients/users.csv`, or `data/users.csv` "
+            "with columns `aadhaar_id,name,dob`."
+        )
+        return
 
-    with st.form("login_form", clear_on_submit=False):
+    with st.form("patient_login_form", clear_on_submit=False):
         aadhaar = st.text_input("Aadhaar ID (12 digits)", max_chars=12)
         dob_input = st.date_input("Date of Birth", value=date(1990, 1, 1))
         submitted = st.form_submit_button("Login")
@@ -879,16 +1361,26 @@ def login_view():
 
 
 def header_bar(user):
-    cols = st.columns([1, 2, 3, 1])
+    cols = st.columns([1, 2, 2, 1])
     with cols[0]:
-        st.subheader("🩺 Swasthi")
+        if st.button("← Home", key="patient_home_btn"):
+            for k in list(st.session_state.keys()):
+                if k != "hospital_section":
+                    del st.session_state[k]
+            st.session_state["hospital_section"] = None
+            st.session_state["logged_in"] = False
+            st.rerun()
     with cols[1]:
-        st.caption("Digital Health Locker • MVP")
+        st.subheader("🩺 Swasthi")
     with cols[2]:
         st.caption(f"Logged in as: {user['name']} ({user['aadhaar_id']})")
     with cols[3]:
         if st.button("Logout"):
-            st.session_state.clear()
+            for k in list(st.session_state.keys()):
+                if k != "hospital_section":
+                    del st.session_state[k]
+            st.session_state["hospital_section"] = "patient"
+            st.session_state["logged_in"] = False
             st.rerun()
 
 
@@ -1343,12 +1835,43 @@ def dashboard_view(user):
                             st.markdown("")  # Add spacing between documents
 
 
+# ============== Main App Routing ==============
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "saved_hashes" not in st.session_state:
     st.session_state["saved_hashes"] = set()
+if "hospital_section" not in st.session_state:
+    st.session_state["hospital_section"] = None
 
-if not st.session_state["logged_in"]:
-    login_view()
-else:
-    dashboard_view(st.session_state["user"]) 
+section = st.session_state.get("hospital_section")
+
+# Main landing - no section selected
+if section is None:
+    main_landing_view()
+
+# OPD section
+elif section == "opd":
+    if st.session_state.get("opd_logged_in"):
+        opd_doctor_portal()
+    else:
+        if st.button("← Back to Home", key="opd_back"):
+            st.session_state["hospital_section"] = None
+            st.rerun()
+        opd_doctor_login()
+
+# Laboratory section
+elif section == "laboratory":
+    if st.button("← Back to Home", key="lab_back"):
+        st.session_state["hospital_section"] = None
+        st.rerun()
+    laboratory_view()
+
+# Patient section
+elif section == "patient":
+    if not st.session_state["logged_in"]:
+        if st.button("← Back to Home", key="patient_back"):
+            st.session_state["hospital_section"] = None
+            st.rerun()
+        patient_login_view()
+    else:
+        dashboard_view(st.session_state["user"]) 
