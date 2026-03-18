@@ -145,6 +145,27 @@ def load_doctors() -> pd.DataFrame:
         return pd.DataFrame(columns=["doctor_id", "name", "password"])
 
 
+def load_opd_patients_db() -> List[Dict]:
+    """Load patient database from opd_patients.json for auto-fill functionality"""
+    try:
+        db_path = os.path.join("data", "patients", "opd_patients.json")
+        if not os.path.exists(db_path):
+            return []
+        with open(db_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def get_patient_by_aadhaar(aadhaar: str) -> Optional[Dict]:
+    """Get patient data by Aadhaar ID from database"""
+    patients = load_opd_patients_db()
+    for patient in patients:
+        if patient.get("aadhaar_id") == aadhaar:
+            return patient
+    return None
+
+
 def load_opd_patients() -> List[Dict]:
     try:
         if not os.path.exists(OPD_PATIENTS_PATH):
@@ -1112,39 +1133,236 @@ def opd_doctor_portal():
     
     with tab_prev:
         st.markdown("#### View Previous Patient Information")
-        patient_id = st.text_input("Enter Patient ID (Aadhaar)", key="prev_patient_id").strip()
-        if patient_id and st.button("View Patient"):
-            users = load_users()
-            row = users.loc[users["aadhaar_id"] == patient_id]
-            if row.empty:
-                st.warning("Patient not found.")
+        
+        # Get OPD patients for this specific doctor
+        opd_patients = load_opd_patients()
+        doctor_opd_patients = [p for p in opd_patients if p.get("doctor_id") == doc["doctor_id"]]
+        
+        # Sort by date/time (newest first)
+        doctor_opd_patients.sort(key=lambda x: x.get("date", ""), reverse=True)
+        
+        # Search functionality
+        # Handle view details button click first
+        if "view_details_patient" in st.session_state:
+            search_aadhaar = st.session_state["view_details_patient"]
+            st.session_state.pop("view_details_patient", None)
+        else:
+            search_aadhaar = st.text_input("🔍 Search Patient by Aadhaar ID", max_chars=12, key="opd_search_aadhaar").strip()
+        
+        if search_aadhaar:
+            # Search in OPD patients for this doctor
+            found_patient = None
+            for p in doctor_opd_patients:
+                if p.get("patient_id") == search_aadhaar:
+                    found_patient = p
+                    break
+            
+            if found_patient:
+                st.success(f"✅ Patient found: {found_patient.get('name', 'Unknown')}")
+                
+                # Show patient details
+                with st.container(border=True):
+                    col_header, col_close = st.columns([4, 1])
+                    with col_header:
+                        st.markdown(f"### 📋 Patient Details")
+                    with col_close:
+                        if st.button("❌ Close", key="close_patient_detail"):
+                            st.session_state["opd_search_aadhaar"] = ""
+                            st.rerun()
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**Name:** {found_patient.get('name', 'N/A')}")
+                        st.markdown(f"**Age:** {found_patient.get('age', 'N/A')} years")
+                        st.markdown(f"**Gender:** {found_patient.get('gender', 'N/A')}")
+                        st.markdown(f"**BP:** {found_patient.get('bp', 'N/A')}")
+                    with col2:
+                        st.markdown(f"**Weight:** {found_patient.get('weight', 'N/A')} kg")
+                        st.markdown(f"**Patient ID:** {found_patient.get('patient_id', 'N/A')}")
+                        st.markdown(f"**OPD ID:** {found_patient.get('opd_id', 'N/A')}")
+                        st.markdown(f"**Date:** {found_patient.get('date', 'N/A')}")
+                    
+                    st.markdown(f"**Symptoms:** {found_patient.get('symptoms', 'N/A')}")
+                    
+                    # Check for repeat visits
+                    all_opd_patients = load_opd_patients()
+                    patient_visits = [p for p in all_opd_patients if p.get('patient_id') == found_patient.get('patient_id')]
+                    
+                    if len(patient_visits) > 1:
+                        st.markdown("#### 🔄 Repeat Visit History")
+                        for i, visit in enumerate(sorted(patient_visits, key=lambda x: x.get('date', ''), reverse=True), 1):
+                            visit_date = visit.get('date', 'N/A')
+                            visit_symptoms = visit.get('symptoms', 'N/A')
+                            visit_opd_id = visit.get('opd_id', 'N/A')
+                            
+                            # Highlight current visit
+                            if visit.get('opd_id') == found_patient.get('opd_id'):
+                                st.markdown(f"**Visit #{i} (Current):** 📅 {visit_date} | 🩺 {visit_symptoms}")
+                            else:
+                                st.markdown(f"**Visit #{i}:** 📅 {visit_date} | 🩺 {visit_symptoms}")
+                        st.markdown("---")
+                    
+                    # Get patient files
+                    patient_id = found_patient.get('patient_id')
+                    user_dir = ensure_user_dir(patient_id)
+                    patient_files = list_user_files(user_dir)
+                    
+                    if patient_files:
+                        st.markdown("#### 📄 Patient Files")
+                        for f in patient_files:
+                            with st.container(border=True):
+                                col_info, col_actions = st.columns([3, 1])
+                                with col_info:
+                                    st.write(f"**{f['name']}** • {f['size_kb']:.1f} KB")
+                                with col_actions:
+                                    col_open, col_summary = st.columns(2)
+                                    with col_open:
+                                        if st.button("🔓 Open", key=f"open_{f['name']}", use_container_width=True):
+                                            st.session_state[f"view_file_{f['name']}"] = True
+                                    with col_summary:
+                                        if st.button("🤖 Summarize", key=f"summarize_{f['name']}", use_container_width=True):
+                                            st.session_state[f"summarize_file_{f['name']}"] = True
+                                
+                                # File viewer
+                                if st.session_state.get(f"view_file_{f['name']}", False):
+                                    st.markdown(f"**📄 File: {f['name']}**")
+                                    if f["name"].lower().endswith((".png", ".jpg", ".jpeg")):
+                                        st.image(f["path"], use_column_width=True)
+                                    elif f["name"].lower().endswith(".pdf"):
+                                        try:
+                                            doc_pdf = fitz.open(f["path"])
+                                            for page_num in range(len(doc_pdf)):
+                                                page = doc_pdf[page_num]
+                                                mat = fitz.Matrix(2, 2)
+                                                pix = page.get_pixmap(matrix=mat)
+                                                img_bytes = pix.tobytes("png")
+                                                st.image(img_bytes, caption=f"Page {page_num + 1} of {len(doc_pdf)}", use_column_width=True)
+                                            doc_pdf.close()
+                                        except Exception as e:
+                                            st.error(f"Error opening PDF: {e}")
+                                    if st.button("Close", key=f"close_{f['name']}"):
+                                        st.session_state[f"view_file_{f['name']}"] = False
+                                        st.rerun()
+                                
+                                # AI Summarizer
+                                if st.session_state.get(f"summarize_file_{f['name']}", False):
+                                    st.markdown(f"**🤖 AI Analysis: {f['name']}**")
+                                    with st.spinner("Analyzing file..."):
+                                        try:
+                                            # Extract text
+                                            h = file_sha256(f["path"])
+                                            text = extract_text(f["path"], h)
+                                            
+                                            # Analyze with focus on lab values
+                                            lab_analysis = analyze_lab_values(text)
+                                            
+                                            if lab_analysis:
+                                                st.markdown("#### 🔬 Lab Report Analysis")
+                                                
+                                                abnormal_values = lab_analysis.get("abnormal_values", [])
+                                                if abnormal_values:
+                                                    st.markdown("**⚠️ Abnormal Values Found:**")
+                                                    for abv in abnormal_values[:8]:
+                                                        status = abv.get("status", "").lower()
+                                                        status_emoji = "⬆️" if status == "high" else "⬇️"
+                                                        st.markdown(f"- {status_emoji} **{abv.get('test_name', 'Test')}:** {abv.get('value', 'N/A')} {abv.get('unit', '')} (Normal: {abv.get('normal_range', 'N/A')})")
+                                                    
+                                                    possible_diseases = lab_analysis.get("possible_diseases", [])
+                                                    if possible_diseases:
+                                                        st.markdown("**🦠 Possible Conditions:**")
+                                                        for pd in possible_diseases[:5]:
+                                                            st.markdown(f"- **{pd.get('disease', 'Unknown')}:** {pd.get('reason', 'Based on abnormal lab values')}")
+                                                else:
+                                                    st.success("✅ All test values are within normal ranges.")
+                                                
+                                                summary_text = lab_analysis.get("summary", "")
+                                                if summary_text:
+                                                    st.markdown(f"**📋 Summary:** {summary_text}")
+                                            else:
+                                                # Fallback to general analysis
+                                                parsed = parse_report_text(text)
+                                                st.markdown("**📄 Extracted Information:**")
+                                                for key, value in parsed.items():
+                                                    if value and value.strip():
+                                                        st.markdown(f"- **{key.replace('_', ' ').title()}:** {value}")
+                                        
+                                        except Exception as e:
+                                            st.error(f"Error analyzing file: {e}")
+                                    
+                                    if st.button("Close Summary", key=f"close_sum_{f['name']}"):
+                                        st.session_state[f"summarize_file_{f['name']}"] = False
+                                        st.rerun()
+                    
+                    # Also show disease history if available
+                    history = load_disease_history(patient_id)
+                    if history:
+                        st.markdown("#### 📋 Medical History")
+                        for entry in history:
+                            with st.expander(f"📄 {entry.get('file_name', 'Record')} - {entry.get('date', '')}"):
+                                st.markdown(f"**Diagnosis:** {entry.get('disease', 'N/A')}")
+                                st.markdown(f"**Symptoms:** {entry.get('symptoms', 'N/A')}")
+                                st.markdown(f"**Doctor:** {entry.get('doctor', 'N/A')}")
             else:
-                user = row.iloc[0].to_dict()
-                history = load_disease_history(patient_id)
-                st.success(f"Patient: {user['name']}")
-                if not history:
-                    st.info("No medical records found for this patient.")
-                else:
-                    for entry in history:
-                        with st.expander(f"📄 {entry.get('file_name', 'Record')} - {entry.get('date', '')}"):
-                            st.markdown(f"**Diagnosis:** {entry.get('disease', 'N/A')}")
-                            st.markdown(f"**Symptoms:** {entry.get('symptoms', 'N/A')}")
-                            st.markdown(f"**Doctor:** {entry.get('doctor', 'N/A')}")
+                st.warning("❌ Patient not found in your OPD registrations.")
+        
+        # Show all OPD patients for this doctor
+        if doctor_opd_patients:
+            st.markdown(f"#### 📋 Your OPD Patients ({len(doctor_opd_patients)} total)")
+            for p in doctor_opd_patients:
+                with st.container(border=True):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"**{p['name']}** | Age: {p['age']} | Aadhaar: {p['patient_id'][-4:]}****")
+                        st.caption(f"📅 {p.get('date', 'N/A')} | 🩺 {p.get('symptoms', 'N/A')[:50]}...")
+                    with col2:
+                        if st.button("View Details", key=f"details_{p['opd_id']}", use_container_width=True):
+                            # Set the search field to this patient's Aadhaar using session state before widget
+                            st.session_state["view_details_patient"] = p["patient_id"]
+                            st.rerun()
+        else:
+            st.info("No OPD patients registered yet. Add patients through the 'New Patients' tab.")
     
     with tab_new:
         st.markdown("#### New Patients in OPD")
         opd_patients = load_opd_patients()
         
+        # Filter to show only current doctor's patients
+        doctor_opd_patients_new = [p for p in opd_patients if p.get("doctor_id") == doc["doctor_id"]]
+        
         # Add new OPD patient form
-        with st.expander("➕ Register New OPD Patient", expanded=len(opd_patients) == 0):
+        with st.expander("➕ Register New OPD Patient", expanded=len(doctor_opd_patients_new) == 0):
+            st.markdown("**Enter Patient ID (Aadhaar) to auto-fill patient details**")
+            
+            # Aadhaar input at the top
+            p_aadhaar = st.text_input("Patient ID (Aadhaar - 12 digits)", max_chars=12, key="opd_aadhaar_input")
+            
+            # Auto-fill patient data if Aadhaar is found
+            auto_filled_data = None
+            if p_aadhaar and len(p_aadhaar) == 12 and p_aadhaar.isdigit():
+                auto_filled_data = get_patient_by_aadhaar(p_aadhaar)
+                if auto_filled_data:
+                    st.success(f"✅ Patient found: {auto_filled_data.get('name', 'Unknown')}")
+                else:
+                    st.info("Patient not found in database. Please enter details manually.")
+            
             with st.form("add_opd_patient"):
-                p_name = st.text_input("Patient Name")
-                p_age = st.number_input("Age", min_value=1, max_value=120, value=30)
-                p_gender = st.selectbox("Gender", ["Male", "Female", "Other"])
-                p_bp = st.text_input("BP (e.g., 120/80)", value="120/80")
-                p_weight = st.number_input("Weight (kg)", min_value=1.0, value=70.0)
-                p_symptoms = st.text_area("Symptoms / Chief Complaint")
-                p_aadhaar = st.text_input("Patient ID (Aadhaar - 12 digits)", max_chars=12)
+                # Use auto-filled data if available, otherwise manual input
+                if auto_filled_data:
+                    p_name = st.text_input("Patient Name", value=auto_filled_data.get('name', ''), disabled=True)
+                    p_age = st.number_input("Age", min_value=1, max_value=120, value=auto_filled_data.get('age', 30))
+                    p_gender = st.selectbox("Gender", ["Male", "Female", "Other"], 
+                                         index=["Male", "Female", "Other"].index(auto_filled_data.get('gender', 'Male')) if auto_filled_data.get('gender') in ["Male", "Female", "Other"] else 0)
+                    p_bp = st.text_input("BP (e.g., 120/80)", value=auto_filled_data.get('bp', '120/80'))
+                    p_weight = st.number_input("Weight (kg)", min_value=1.0, value=float(auto_filled_data.get('weight_kg', 70)))
+                    p_symptoms = st.text_area("Symptoms / Chief Complaint", value=auto_filled_data.get('symptoms', ''))
+                else:
+                    p_name = st.text_input("Patient Name")
+                    p_age = st.number_input("Age", min_value=1, max_value=120, value=30)
+                    p_gender = st.selectbox("Gender", ["Male", "Female", "Other"])
+                    p_bp = st.text_input("BP (e.g., 120/80)", value="120/80")
+                    p_weight = st.number_input("Weight (kg)", min_value=1.0, value=70.0)
+                    p_symptoms = st.text_area("Symptoms / Chief Complaint")
+                
                 if st.form_submit_button("Add to OPD"):
                     if len(p_aadhaar) == 12 and p_aadhaar.isdigit():
                         pid = f"OPD_{datetime.now().strftime('%Y%m%d%H%M%S')}_{p_aadhaar[-4:]}"
@@ -1167,10 +1385,10 @@ def opd_doctor_portal():
                     else:
                         st.error("Valid 12-digit Aadhaar required.")
         
-        if not opd_patients:
+        if not doctor_opd_patients_new:
             st.info("No new patients. Add one above.")
         else:
-            for p in opd_patients:
+            for p in doctor_opd_patients_new:
                 with st.container(border=True):
                     c1, c2 = st.columns([3, 1])
                     with c1:
@@ -1186,11 +1404,43 @@ def opd_doctor_portal():
         
         if "opd_view_pdf" in st.session_state:
             p = st.session_state["opd_view_pdf"]
-            pdf_bytes = generate_opd_patient_pdf(p)
-            st.download_button("📥 Download Patient Vitals PDF", data=pdf_bytes, file_name=f"opd_{p['opd_id']}.pdf", mime="application/pdf")
-            if st.button("Close"):
-                st.session_state.pop("opd_view_pdf", None)
-                st.rerun()
+            with st.container(border=True):
+                st.markdown(f"### 📄 Patient Vitals - {p['name']}")
+                
+                # Generate PDF and display as image
+                pdf_bytes = generate_opd_patient_pdf(p)
+                try:
+                    # Convert PDF to images for display
+                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    for page_num in range(len(doc)):
+                        page = doc[page_num]
+                        mat = fitz.Matrix(2, 2)  # Zoom factor for better quality
+                        pix = page.get_pixmap(matrix=mat)
+                        img_bytes = pix.tobytes("png")
+                        st.image(img_bytes, caption=f"Page {page_num + 1}", use_column_width=True)
+                    doc.close()
+                except Exception as e:
+                    st.error(f"Error displaying PDF: {e}")
+                    # Fallback: show as text
+                    st.markdown(f"""
+                    **Patient Details:**
+                    - **Name:** {p.get('name', 'N/A')}
+                    - **Age:** {p.get('age', 'N/A')} years
+                    - **Gender:** {p.get('gender', 'N/A')}
+                    - **BP:** {p.get('bp', 'N/A')}
+                    - **Weight:** {p.get('weight', 'N/A')} kg
+                    - **Symptoms:** {p.get('symptoms', 'N/A')}
+                    - **Patient ID:** {p.get('patient_id', 'N/A')}
+                    - **Date:** {p.get('date', 'N/A')}
+                    """)
+                
+                col_download, col_close = st.columns(2)
+                with col_download:
+                    st.download_button("📥 Download PDF", data=pdf_bytes, file_name=f"opd_{p['opd_id']}.pdf", mime="application/pdf")
+                with col_close:
+                    if st.button("Close", key="close_pdf_view"):
+                        st.session_state.pop("opd_view_pdf", None)
+                        st.rerun()
         
         if "opd_recommend_for" in st.session_state:
             p = st.session_state["opd_recommend_for"]
@@ -1230,6 +1480,14 @@ def opd_doctor_portal():
         
         patient_id = st.text_input("Enter Patient ID (Aadhaar)", key="report_patient_id").strip()
         if patient_id and st.button("View Reports"):
+            # Check if patient is registered to current doctor
+            opd_patients = load_opd_patients()
+            doctor_patient_ids = [p.get('patient_id') for p in opd_patients if p.get('doctor_id') == doc['doctor_id']]
+            
+            if patient_id not in doctor_patient_ids:
+                st.warning("❌ This patient is not registered to your OPD. You can only view reports for your registered patients.")
+                return
+            
             reports_dir = os.path.join(LAB_REPORTS_DIR, patient_id)
             if not os.path.isdir(reports_dir):
                 st.info("No lab reports found for this patient.")
@@ -1291,37 +1549,65 @@ def laboratory_view():
     with tab_upload:
         st.markdown("#### Upload Lab Report for Patient")
         patient_id = st.text_input("Patient ID (Aadhaar)", key="lab_upload_patient").strip()
-        request_id = st.text_input("Request ID (optional)", key="lab_upload_req").strip()
         
         if patient_id:
             requests = load_lab_requests()
-            doc_reqs = [r for r in requests if r["patient_id"] == patient_id]
-            request_id = ""
-            doctor_id = ""
-            if doc_reqs:
-                sel = st.selectbox("Link to request:", [r["request_id"] for r in doc_reqs], key="lab_link_req")
-                req = next(r for r in doc_reqs if r["request_id"] == sel)
-                request_id = req["request_id"]
-                doctor_id = req.get("doctor_id", "")
+            # Only show pending requests for this patient
+            pending_requests = [r for r in requests if r["patient_id"] == patient_id and r.get("status") == "pending"]
             
-            uploaded = st.file_uploader("Upload Report (PDF or Image)", type=["pdf", "png", "jpg", "jpeg"])
-            if uploaded and st.button("Save Report"):
-                pt_dir = os.path.join(LAB_REPORTS_DIR, patient_id)
-                os.makedirs(pt_dir, exist_ok=True)
-                ts = time.strftime("%Y%m%d-%H%M%S")
-                fname = f"{ts}__{uploaded.name}"
-                fpath = os.path.join(pt_dir, fname)
-                with open(fpath, "wb") as f:
-                    f.write(uploaded.getbuffer())
-                meta = {"patient_id": patient_id, "request_id": request_id, "doctor_id": doctor_id, "uploaded_at": datetime.now().isoformat()}
-                with open(fpath + ".meta.json", "w") as mf:
-                    json.dump(meta, mf)
-                for r in requests:
-                    if r.get("request_id") == request_id:
-                        r["status"] = "completed"
-                        break
-                save_lab_requests(requests)
-                st.success("Report uploaded and sent to doctor!")
+            if not pending_requests:
+                st.warning("❌ No pending lab requests found for this patient. Files can only be uploaded for patients with pending requests.")
+                st.info("💡 Patients with pending requests will appear here once doctors recommend tests.")
+            else:
+                st.success(f"✅ Found {len(pending_requests)} pending request(s) for this patient")
+                
+                # Show pending requests
+                st.markdown("#### 📋 Pending Requests:")
+                for req in pending_requests:
+                    with st.container(border=True):
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.markdown(f"**Request ID:** {req['request_id']}")
+                            st.markdown(f"**Doctor:** {req.get('doctor_name', 'N/A')}")
+                            st.markdown(f"**Tests:** {', '.join(req.get('tests', []))}")
+                            st.markdown(f"**Date:** {req.get('date', 'N/A')}")
+                        with col2:
+                            st.markdown(f"**Status:** 🟡 Pending")
+                
+                # Request selection
+                sel = st.selectbox("Select request to upload report for:", 
+                                 [r["request_id"] for r in pending_requests], 
+                                 key="lab_link_req")
+                selected_req = next(r for r in pending_requests if r["request_id"] == sel)
+                
+                # Show file uploader only for valid pending requests
+                uploaded = st.file_uploader("Upload Report (PDF or Image)", type=["pdf", "png", "jpg", "jpeg"])
+                if uploaded and st.button("Save Report"):
+                    pt_dir = os.path.join(LAB_REPORTS_DIR, patient_id)
+                    os.makedirs(pt_dir, exist_ok=True)
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    fname = f"{ts}__{uploaded.name}"
+                    fpath = os.path.join(pt_dir, fname)
+                    with open(fpath, "wb") as f:
+                        f.write(uploaded.getbuffer())
+                    meta = {
+                        "patient_id": patient_id, 
+                        "request_id": selected_req["request_id"], 
+                        "doctor_id": selected_req.get("doctor_id", ""), 
+                        "uploaded_at": datetime.now().isoformat()
+                    }
+                    with open(fpath + ".meta.json", "w") as mf:
+                        json.dump(meta, mf)
+                    
+                    # Update request status to completed
+                    for r in requests:
+                        if r.get("request_id") == selected_req["request_id"]:
+                            r["status"] = "completed"
+                            break
+                    save_lab_requests(requests)
+                    st.success("✅ Report uploaded successfully and sent to doctor!")
+                    st.balloons()
+                    st.rerun()
 
 
 # ============== Patient Section ==============
