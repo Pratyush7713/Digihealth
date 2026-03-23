@@ -27,8 +27,10 @@ A Streamlit-based Digital Health application designed to simulate a Hospital Lab
 🌐 Multilingual Support
 - Translation using GoogleTranslator
 - Enables accessibility for non-English users
+  
 🔊 Text-to-Speech
 - Convert extracted or generated text into audio using gTTS
+  
 📊 Data Handling
 - Uses Pandas for structured data operations
 - JSON/CSV-based lightweight storage system
